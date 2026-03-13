@@ -203,13 +203,22 @@ def main():
     if args.calibration == "none":
         probabilities = best_model.predict(xgb.DMatrix(X_test))
     else:
-        calibrator = CalibratedClassifierCV(
-            BoosterWrapper(best_model, NUM_CLASSES),
-            method=args.calibration,
-            cv="prefit",
-        )
-        calibrator.fit(X_calib, y_calib)
-        probabilities = calibrator.predict_proba(X_test)
+        # Use _SigmoidCalibration directly for sklearn 1.6+ compatibility
+        from sklearn.calibration import _SigmoidCalibration
+        calib_raw = best_model.predict(xgb.DMatrix(X_calib))
+        calib_raw_p1 = calib_raw[:, 1] if calib_raw.ndim == 2 else calib_raw
+        sigmoid_cal = _SigmoidCalibration()
+        sigmoid_cal.fit(calib_raw_p1, y_calib)
+
+        # Build a simple calibrator wrapper for saving
+        wrapper = BoosterWrapper(best_model, NUM_CLASSES)
+        wrapper._sigmoid_cal = sigmoid_cal
+        calibrator = wrapper
+
+        raw_test = best_model.predict(xgb.DMatrix(X_test))
+        raw_p1 = raw_test[:, 1] if raw_test.ndim == 2 else raw_test
+        cal_p1 = sigmoid_cal.predict(raw_p1)
+        probabilities = np.column_stack([1 - cal_p1, cal_p1])
 
     y_pred = np.argmax(probabilities, axis=1)
     accuracy = accuracy_score(y_test, y_pred)
@@ -240,9 +249,9 @@ def main():
     best_model.save_model(str(model_path))
     print(f"Saved model: {model_path}")
 
-    if calibrator is not None:
+    if calibrator is not None and hasattr(calibrator, '_sigmoid_cal'):
         calibration_path = MODEL_DIR / f"{model_path.stem}_calibration.pkl"
-        joblib.dump(calibrator, calibration_path)
+        joblib.dump(calibrator._sigmoid_cal, calibration_path)
         print(f"Saved calibration: {calibration_path}")
 
 

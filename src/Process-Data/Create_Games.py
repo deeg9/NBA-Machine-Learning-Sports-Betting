@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -80,6 +80,20 @@ def fetch_team_table(teams_con, date_str):
     return pd.read_sql_query(f'SELECT * FROM "{date_str}"', teams_con)
 
 
+def fetch_previous_team_table(teams_con, date_str):
+    """Walk back from date_str - 1 day to find the most recent prior TeamData table.
+
+    This avoids data leakage: same-day tables include results of games played
+    that day, so we must use data from before the game.
+    """
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    for i in range(1, 8):  # max 7 days back
+        prev = (dt - timedelta(days=i)).strftime("%Y-%m-%d")
+        if table_exists(teams_con, prev):
+            return pd.read_sql_query(f'SELECT * FROM "{prev}"', teams_con)
+    return None
+
+
 def build_game_features(team_df, home_team, away_team, index_map):
     home_index = index_map.get(home_team)
     away_index = index_map.get(away_team)
@@ -137,7 +151,7 @@ def main():
 
             for row in odds_df.itertuples(index=False):
                 date_str = normalize_date(row.Date)
-                team_df = fetch_team_table(teams_con, date_str)
+                team_df = fetch_previous_team_table(teams_con, date_str)
                 if team_df is None:
                     continue
 

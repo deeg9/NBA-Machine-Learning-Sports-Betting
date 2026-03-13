@@ -105,3 +105,5 @@ venv.bak/
 
 .idea
 .DS_Store
+kalshi_private_key.pem
+logs/
