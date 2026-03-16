@@ -64,6 +64,8 @@ def load_odds_2025():
         date_val = pd.to_datetime(row["Date"], errors="coerce")
         if pd.isna(date_val):
             continue
+        # Odds DB dates are 1 day ahead of dataset dates; align to dataset
+        date_val -= pd.Timedelta(days=1)
         key = (date_val.strftime("%Y-%m-%d"), row["Home"], row["Away"])
         odds_map[key] = {
             "ML_Home": row["ML_Home"],
