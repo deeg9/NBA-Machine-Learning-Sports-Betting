@@ -90,6 +90,80 @@ KALSHI_ABBR = {
 }
 
 
+def fetch_kalshi_results(target_date_str):
+    """Fetch settled Kalshi NBA game results. Returns dict keyed by
+    (home_team, away_team) → winning_team full name, or empty dict on failure."""
+    try:
+        import kalshi_python_sync as kalshi
+        from kalshi_python_sync.auth import KalshiAuth
+    except ImportError:
+        return {}
+
+    api_key = os.getenv("KALSHI_API_KEY", "")
+    key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi_private_key.pem")
+    if not api_key or not Path(key_path).exists():
+        return {}
+
+    try:
+        config = kalshi.Configuration()
+        config.host = "https://api.elections.kalshi.com/trade-api/v2"
+        client = kalshi.KalshiClient(configuration=config)
+        client.kalshi_auth = KalshiAuth(
+            key_id=api_key, private_key_pem=open(key_path).read()
+        )
+        market_api = kalshi.MarketApi(client)
+
+        dt = pd.to_datetime(target_date_str)
+        date_tag = dt.strftime("%y%b%d").upper()
+
+        resp = market_api.get_markets_without_preload_content(
+            series_ticker="KXNBAGAME", status="settled", limit=200
+        )
+        data = json.loads(resp.data)
+        all_markets = data.get("markets", [])
+
+        # Find winners: result="yes" means that team's market resolved yes (they won)
+        winners = {}  # game_code → winning team abbr
+        game_teams = {}  # game_code → {away_abbr, home_abbr} (away first in code)
+        for m in all_markets:
+            ticker = m.get("ticker", "")
+            if date_tag not in ticker:
+                continue
+            parts = ticker.split("-")
+            if len(parts) < 3:
+                continue
+            game_code = parts[1].replace(date_tag, "")
+            team_abbr = parts[2]
+            if team_abbr not in KALSHI_ABBR:
+                continue
+            game_teams.setdefault(game_code, []).append(team_abbr)
+            if m.get("result") == "yes":
+                winners[game_code] = team_abbr
+
+        # Build results dict keyed by (home_team, away_team) → winning_team
+        results = {}
+        for game_code, abbrs in game_teams.items():
+            abbrs = list(dict.fromkeys(abbrs))  # dedupe preserving order
+            if len(abbrs) != 2:
+                continue
+            # First abbr in game code is away team
+            away_abbr, home_abbr = abbrs[0], abbrs[1]
+            if game_code.startswith(home_abbr):
+                away_abbr, home_abbr = home_abbr, away_abbr
+
+            home_team = KALSHI_ABBR[home_abbr]
+            away_team = KALSHI_ABBR[away_abbr]
+            if game_code in winners:
+                results[(home_team, away_team)] = KALSHI_ABBR[winners[game_code]]
+
+        if results:
+            print(f"[Kalshi] Fetched results for {len(results)} settled games")
+        return results
+    except Exception as e:
+        print(f"[Kalshi] Could not fetch results: {e}")
+        return {}
+
+
 def fetch_kalshi_prices(target_date_str):
     """Try to fetch live Kalshi NBA game market prices. Returns dict keyed by
     (home_team, away_team) → contract_price (cents), or empty dict on failure."""
@@ -292,6 +366,11 @@ def main():
     kalshi_prices = fetch_kalshi_prices(target_str)
     odds_map = load_odds_for_date(target_str)
 
+    # Try to get settled results from Kalshi (for games without dataset results)
+    kalshi_results = {}
+    if not has_results:
+        kalshi_results = fetch_kalshi_results(target_str)
+
     # Determine which games to predict
     if has_results:
         print(f"\nFound {len(target_games)} completed games in dataset for {target_str}")
@@ -346,11 +425,27 @@ def main():
     if not kalshi_prices and not odds_map:
         print("No market prices available (Kalshi or odds DB)")
 
+    # Merge Kalshi settled results into games_data
+    any_results = has_results
+    for g in games_data:
+        if not g["has_result"]:
+            key = (g["home"], g["away"])
+            winner = kalshi_results.get(key)
+            if winner:
+                g["has_result"] = True
+                g["actual_home_win"] = (winner == g["home"])
+                g["result_source"] = "kalshi"
+                any_results = True
+            else:
+                g["result_source"] = None
+        else:
+            g["result_source"] = "dataset"
+
     # Display predictions
     print("\n" + "-" * 80)
     header = (f"  {'Matchup':<38} {'Model':>6} {'Mkt':>5} {'Edge':>6} "
               f"{'Side':>5} {'Qty':>4} {'Cost':>7}")
-    if has_results:
+    if any_results:
         header += f" {'Result':>8}"
     else:
         header += f" {'Tip':>10}"
@@ -426,9 +521,12 @@ def main():
                     losses += 1
                 total_pnl += profit
                 pnl_str = f"${profit/100:+.2f}"
-                tail = f" {'OK' if correct else 'X':>3} {pnl_str:>7}" if trade else f" {'OK' if correct else 'X':>3}"
+                tail = f" {'OK' if correct else 'X':>3} {pnl_str:>7}"
             else:
                 tail = f" {'OK' if correct else 'X':>5}"
+        elif any_results:
+            # Some games settled, this one pending
+            tail = "  pending"
         else:
             tail = f" {g.get('tip_time', ''):>10}"
 
@@ -462,9 +560,17 @@ def main():
         print(f"\n  Total exposure: ${total_cost/100:.2f} / "
               f"${DAILY_LOSS_LIMIT_CENTS/100:.2f} daily limit")
 
-        if has_results and trades:
-            print(f"\n  ACTUAL P&L: ${total_pnl/100:+.2f}  "
-                  f"({wins}W-{losses}L, {wins/(wins+losses):.0%} win rate)")
+        if any_results and trades:
+            settled_trades = [t for t in trades if t["game"]["has_result"]]
+            pending_trades = [t for t in trades if not t["game"]["has_result"]]
+            if wins + losses > 0:
+                print(f"\n  ACTUAL P&L: ${total_pnl/100:+.2f}  "
+                      f"({wins}W-{losses}L, {wins/(wins+losses):.0%} win rate)")
+                if kalshi_results and not has_results:
+                    print(f"  (Results from Kalshi settled markets)")
+            if pending_trades:
+                pending_cost = sum(t["trade"]["cost_cents"] for t in pending_trades)
+                print(f"  Pending: {len(pending_trades)} trade(s), ${pending_cost/100:.2f} at risk")
         else:
             max_profit = sum(t["trade"]["count"] * (100 - t["trade"]["price"]) for t in trades)
             max_loss = total_cost
