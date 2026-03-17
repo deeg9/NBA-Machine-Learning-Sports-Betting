@@ -266,6 +266,7 @@ def build_feature_row_from_dataset(home_team, away_team, df, feature_cols,
             "Roll10_TOV_Away", "Roll10_PLUS_MINUS_Away", "Away_WinPct_Split",
             "Pace_Away", "PTS_per100_Away", "AST_per100_Away", "TOV_per100_Away",
             "STL_per100_Away", "Is_B2B_Away",
+            "Travel_Dist_Away", "Injuries_Out_Away", "Injuries_GTD_Away",
         ]:
             if col in away_row.index:
                 base_row[col] = away_row[col]
@@ -297,6 +298,77 @@ def build_feature_row_from_dataset(home_team, away_team, df, feature_cols,
         base_row["B2B_Advantage"] = int(base_row.get("Is_B2B_Away", 0)) - int(base_row.get("Is_B2B_Home", 0))
     if "Rest_Advantage" in base_row.index:
         base_row["Rest_Advantage"] = base_row.get("Days-Rest-Home", 0) - base_row.get("Days-Rest-Away", 0)
+
+    # --- Travel features for today's game ---
+    from src.Features.arena_data import get_arena
+    from src.Features.travel_features import _haversine, _tz_offset
+
+    home_arena = get_arena(home_team)
+    away_home_arena = get_arena(away_team)
+    if home_arena and away_home_arena:
+        # Elevation difference
+        if "Elevation_Diff" in base_row.index:
+            base_row["Elevation_Diff"] = home_arena["elev_ft"] - away_home_arena["elev_ft"]
+
+        # Away team travel: find their most recent game location
+        away_any = df[
+            (df["TEAM_NAME"] == away_team) | (df["TEAM_NAME.1"] == away_team)
+        ].sort_values(DATE_COLUMN, ascending=False)
+        if len(away_any) > 0:
+            last_game = away_any.iloc[0]
+            # Previous game was at the home team's arena
+            prev_arena = get_arena(last_game["TEAM_NAME"])
+            if prev_arena and "Travel_Dist_Away" in base_row.index:
+                base_row["Travel_Dist_Away"] = _haversine(
+                    prev_arena["lat"], prev_arena["lon"],
+                    home_arena["lat"], home_arena["lon"],
+                )
+            if prev_arena and "Timezone_Shift_Away" in base_row.index:
+                base_row["Timezone_Shift_Away"] = (
+                    _tz_offset(home_arena["tz"]) - _tz_offset(prev_arena["tz"])
+                )
+            # Road trip length: count consecutive away games
+            if "Road_Trip_Length" in base_row.index:
+                consec = 0
+                for _, g in away_any.iterrows():
+                    if g["TEAM_NAME.1"] == away_team:
+                        consec += 1
+                    else:
+                        break
+                base_row["Road_Trip_Length"] = consec + 1  # +1 for today's away game
+
+        # Home team travel (returning from road)
+        home_any = df[
+            (df["TEAM_NAME"] == home_team) | (df["TEAM_NAME.1"] == home_team)
+        ].sort_values(DATE_COLUMN, ascending=False)
+        if len(home_any) > 0 and "Travel_Dist_Home" in base_row.index:
+            last_home_game = home_any.iloc[0]
+            was_away = last_home_game["TEAM_NAME.1"] == home_team
+            if was_away:
+                prev_arena = get_arena(last_home_game["TEAM_NAME"])
+                if prev_arena:
+                    base_row["Travel_Dist_Home"] = _haversine(
+                        prev_arena["lat"], prev_arena["lon"],
+                        home_arena["lat"], home_arena["lon"],
+                    )
+            else:
+                base_row["Travel_Dist_Home"] = 0.0
+
+    # --- Live injury features ---
+    injury_cols = ["Injuries_Out_Home", "Injuries_Out_Away",
+                   "Injuries_GTD_Home", "Injuries_GTD_Away", "Injury_Advantage"]
+    if any(c in base_row.index for c in injury_cols):
+        try:
+            from src.DataProviders.PlayerDataProvider import fetch_injury_data
+            from src.Features.injury_features import compute_live_injury_counts
+
+            live_injuries = fetch_injury_data()
+            counts = compute_live_injury_counts(home_team, away_team, live_injuries)
+            for col_name, val in counts.items():
+                if col_name in base_row.index:
+                    base_row[col_name] = val
+        except Exception:
+            pass  # Default to whatever was in the dataset row
 
     # Extract feature values in correct order
     values = []

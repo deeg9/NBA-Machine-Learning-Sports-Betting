@@ -433,6 +433,12 @@ def enhance_dataset(df: pd.DataFrame, include_players: bool = False) -> pd.DataF
     df = compute_pace_adjusted(df)
     df = compute_b2b_features(df)
 
+    from src.Features.travel_features import compute_travel_features
+    from src.Features.injury_features import compute_injury_features
+
+    df = compute_travel_features(df)
+    df = compute_injury_features(df)
+
     if include_players:
         from src.Features.player_features import compute_player_features
 
