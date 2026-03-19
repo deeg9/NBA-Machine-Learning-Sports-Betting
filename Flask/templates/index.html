@@ -3,16 +3,53 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>NBA Edge Lab</title>
+    <title>NBA Kalshi Edge Lab</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <style>
+        .dashboard-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }
+        .run-btn { background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; border: none; padding: 0.75rem 1.5rem; border-radius: 12px; cursor: pointer; font-weight: 600; font-size: 0.95rem; transition: all 0.2s; }
+        .run-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 20px rgba(99,102,241,0.4); }
+        .run-btn:disabled { opacity: 0.5; cursor: wait; }
+        .status-bar { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 0.75rem 1.25rem; font-size: 0.85rem; color: rgba(255,255,255,0.5); }
+        .game-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 1.25rem; }
+        .game-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; padding: 1.5rem; transition: all 0.2s; }
+        .game-card:hover { border-color: rgba(255,255,255,0.12); transform: translateY(-2px); }
+        .game-card.has-edge { border-left: 3px solid; }
+        .game-card.side-yes { border-left-color: #22c55e; }
+        .game-card.side-no { border-left-color: #ef4444; }
+        .game-matchup { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+        .team-names { font-size: 1.05rem; font-weight: 600; }
+        .team-names .away { color: rgba(255,255,255,0.6); }
+        .team-names .at { color: rgba(255,255,255,0.25); margin: 0 0.4rem; font-weight: 400; }
+        .side-badge { padding: 0.3rem 0.75rem; border-radius: 8px; font-size: 0.8rem; font-weight: 700; text-transform: uppercase; }
+        .side-badge.yes { background: rgba(34,197,94,0.15); color: #22c55e; }
+        .side-badge.no { background: rgba(239,68,68,0.15); color: #ef4444; }
+        .side-badge.pass { background: rgba(255,255,255,0.05); color: rgba(255,255,255,0.3); }
+        .prob-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
+        .prob-bar-wrap { flex: 1; height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; position: relative; overflow: hidden; }
+        .prob-bar { height: 100%; border-radius: 4px; background: linear-gradient(90deg, #6366f1, #8b5cf6); transition: width 0.5s; }
+        .prob-label { font-size: 0.85rem; min-width: 42px; text-align: right; font-weight: 600; }
+        .market-label { font-size: 0.85rem; min-width: 42px; text-align: right; color: rgba(255,255,255,0.4); }
+        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; margin-top: 0.75rem; }
+        .stat { text-align: center; padding: 0.5rem; background: rgba(255,255,255,0.02); border-radius: 8px; }
+        .stat-label { font-size: 0.7rem; color: rgba(255,255,255,0.35); text-transform: uppercase; letter-spacing: 0.05em; }
+        .stat-value { font-size: 0.95rem; font-weight: 600; margin-top: 0.15rem; }
+        .stat-value.positive { color: #22c55e; }
+        .stat-value.negative { color: #ef4444; }
+        .injury-note { font-size: 0.75rem; color: rgba(255,255,255,0.35); margin-top: 0.5rem; }
+        .injury-note span { color: #f59e0b; }
+        .no-data { text-align: center; padding: 4rem 2rem; color: rgba(255,255,255,0.3); }
+        .no-data h3 { margin-bottom: 1rem; color: rgba(255,255,255,0.5); }
+        .summary-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+        .summary-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 1rem; text-align: center; }
+        .summary-card .val { font-size: 1.5rem; font-weight: 700; }
+        .summary-card .lbl { font-size: 0.75rem; color: rgba(255,255,255,0.4); text-transform: uppercase; margin-top: 0.25rem; }
+    </style>
 </head>
 <body>
-    {% set fanduel_games = data.get('fanduel') or {} %}
-    {% set games_count = fanduel_games|length %}
     <div class="page">
         <div class="backdrop">
             <div class="glow glow-1"></div>
@@ -25,253 +62,155 @@
                 <div class="brand">
                     <div class="brand-mark">NBA</div>
                     <div class="brand-text">
-                        Edge Lab
-                        <small>Machine Learning Picks</small>
+                        Kalshi Edge Lab
+                        <small>Ensemble + Bayesian + Stoikov</small>
                     </div>
-                </div>
-                <div class="nav-links">
-                    <a href="#picks">Today's Board</a>
-                    <a href="#stack">Model Stack</a>
-                    <a href="#insights">Market Pulse</a>
-                </div>
-                <div class="nav-actions">
-                    <a class="btn btn-ghost" href="#picks">View Picks</a>
-                    <a class="btn btn-primary" href="#stack">How It Works</a>
                 </div>
             </nav>
         </header>
 
-        <main>
-            <section class="hero">
-                <div class="hero-copy reveal">
-                    <div class="eyebrow">NBA Machine Learning</div>
-                    <h1>Sharper NBA edges, distilled from every possession.</h1>
-                    <p>
-                        Model-driven win probabilities and totals picks, enriched with sportsbook odds,
-                        expected value, and bankroll guidance. Updated daily for today's slate.
-                    </p>
-                    <div class="hero-actions">
-                        <a class="btn btn-primary" href="#picks">Explore Today's Board</a>
-                        <a class="btn btn-ghost" href="#insights">See Market Pulse</a>
+        <main style="max-width: 1200px; margin: 0 auto; padding: 2rem;">
+            <div class="dashboard-header">
+                <div>
+                    <h2 style="margin:0;">Today's Board</h2>
+                    {% if scan_date %}
+                    <div class="status-bar" style="display:inline-block; margin-top:0.5rem;">
+                        Last scan: {{ scan_date }} | Min edge: {{ (min_edge * 100)|round(0)|int }}% | Games: {{ predictions|length }}
                     </div>
-                    <div class="hero-metrics">
-                        <div class="metric-card">
-                            <span>Today's slate</span>
-                            <strong>{{ games_count }} matchups</strong>
-                        </div>
-                        <div class="metric-card">
-                            <span>Sportsbooks</span>
-                            <strong>FanDuel / DK / MGM</strong>
-                        </div>
-                        <div class="metric-card">
-                            <span>Model focus</span>
-                            <strong>Moneyline + Totals</strong>
-                        </div>
-                    </div>
-                </div>
-                <div class="hero-panel reveal" data-delay="120">
-                    <div>
-                        <div class="eyebrow">Slate snapshot</div>
-                        <h3 class="panel-title">{{ today }} / Live model board</h3>
-                        <p>Confidence-weighted projections with EV overlays and totals lean.</p>
-                    </div>
-                    <div class="pulse-grid">
-                        <div class="pulse-item">
-                            <span class="eyebrow">ML Accuracy</span>
-                            <strong>~69%</strong>
-                        </div>
-                        <div class="pulse-item">
-                            <span class="eyebrow">Totals Accuracy</span>
-                            <strong>~55%</strong>
-                        </div>
-                        <div class="pulse-item">
-                            <span class="eyebrow">Kelly Enabled</span>
-                            <strong>Optional</strong>
-                        </div>
-                    </div>
-                    <div class="chip">Updated {{ today }}</div>
-                </div>
-            </section>
-
-            <section id="insights" class="section">
-                <div class="section-header">
-                    <div>
-                        <div class="eyebrow">Market pulse</div>
-                        <h2>Translate market odds into model-ready signals.</h2>
-                        <p>We blend season-long team stats with live odds to surface value and totals lean.</p>
-                    </div>
-                    <div class="chip">Signal + Context</div>
-                </div>
-                <div class="insights-grid">
-                    <div class="insight-card reveal">
-                        <h4>EV Overlay</h4>
-                        <p>Every side includes expected value so you can separate noise from true edge.</p>
-                    </div>
-                    <div class="insight-card reveal" data-delay="80">
-                        <h4>Rest-Aware Features</h4>
-                        <p>Days of rest and schedule effects are baked into matchup features.</p>
-                    </div>
-                    <div class="insight-card reveal" data-delay="160">
-                        <h4>Odds Consistency</h4>
-                        <p>Compare three books side-by-side and spot pricing gaps instantly.</p>
-                    </div>
-                    <div class="insight-card reveal" data-delay="240">
-                        <h4>Totals Confidence</h4>
-                        <p>Over/under picks include probability confidence to gauge conviction.</p>
-                    </div>
-                </div>
-            </section>
-
-            <section id="picks" class="section">
-                <div class="section-header">
-                    <div>
-                        <div class="eyebrow">Today's Board</div>
-                        <h2>Model picks for every matchup.</h2>
-                        <p>Click any team name to see roster details and player form.</p>
-                    </div>
-                    <div class="chip">{{ today }}</div>
-                </div>
-
-                <div class="picks-grid">
-                    {% for game_key, fd_game in fanduel_games.items() %}
-                    {% set teams = game_key.split(':') %}
-                    {% set away_team = teams[0] %}
-                    {% set home_team = teams[1] %}
-                    {% set lean_team = away_team %}
-                    {% set lean_conf = 0 %}
-                    {% if fd_game and fd_game.away_confidence %}
-                        {% set lean_conf = fd_game.away_confidence|default('0')|float %}
                     {% endif %}
-                    {% if fd_game and fd_game.home_confidence and (fd_game.home_confidence|float) > lean_conf %}
-                        {% set lean_team = fd_game.home_team %}
-                        {% set lean_conf = fd_game.home_confidence|float %}
-                    {% endif %}
-                    <article class="game-card reveal" data-delay="{{ loop.index0 * 60 }}">
-                        <div class="game-header">
-                            <div class="matchup">
-                                <div class="team-stack">
-                                    <span class="team-name" data-bs-toggle="modal" data-bs-target="#modal-{{ away_team|replace(' ', '-')|lower }}">{{ away_team }}</span>
-                                    <span class="team-name" data-bs-toggle="modal" data-bs-target="#modal-{{ home_team|replace(' ', '-')|lower }}">{{ home_team }}</span>
-                                </div>
-                                <span class="at">@</span>
-                            </div>
-                            <div class="lean">
-                                <span>Model lean</span>
-                                <strong>{{ lean_team }}</strong>
-                                <div class="player-meta">{{ lean_conf|round(1) }}% confidence</div>
-                            </div>
-                        </div>
-                        <div class="books-grid">
-                            {% for sportsbook in ['fanduel', 'draftkings', 'betmgm'] %}
-                            {% set book_data = data.get(sportsbook) or {} %}
-                            {% set sbgame = book_data.get(game_key) %}
-                            <div class="book-card">
-                                <div class="book-head">
-                                    <span class="book-name">{{ sportsbook }}</span>
-                                    {% if sbgame %}
-                                        {% if sbgame.ou_pick %}
-                                            <span class="ou-chip {% if sbgame.ou_pick == 'UNDER' %}under{% endif %}">{{ sbgame.ou_pick }} {{ sbgame.ou_value }}</span>
-                                        {% endif %}
-                                    {% endif %}
-                                </div>
-                                {% if sbgame %}
-                                    {% set away_conf = sbgame.away_confidence|default('0')|float %}
-                                    {% set home_conf = sbgame.home_confidence|default('0')|float %}
-                                    {% set away_ev = sbgame.away_team_ev|default('0')|float %}
-                                    {% set home_ev = sbgame.home_team_ev|default('0')|float %}
-                                    <div class="book-lines">
-                                        <div>
-                                            <div class="line-row">
-                                                <span>{{ sbgame.away_team }}</span>
-                                                <span class="odds">
-                                                    {% if sbgame.away_team_odds %}
-                                                        {% if sbgame.away_team_odds|int > 0 %}+{% endif %}{{ sbgame.away_team_odds }}
-                                                    {% else %}
-                                                        --
-                                                    {% endif %}
-                                                </span>
-                                                <span class="confidence">
-                                                    {% if sbgame.away_confidence %}{{ sbgame.away_confidence }}%{% else %}--{% endif %}
-                                                </span>
-                                                <span class="ev {% if away_ev > 0 %}positive{% else %}negative{% endif %}">
-                                                    {{ sbgame.away_team_ev if sbgame.away_team_ev else '--' }}
-                                                </span>
-                                            </div>
-                                            <div class="confidence-bar" style="--bar: {{ away_conf }}%;">
-                                                <span></span>
-                                            </div>
-                                        </div>
-                                        <div>
-                                            <div class="line-row">
-                                                <span>{{ sbgame.home_team }}</span>
-                                                <span class="odds">
-                                                    {% if sbgame.home_team_odds %}
-                                                        {% if sbgame.home_team_odds|int > 0 %}+{% endif %}{{ sbgame.home_team_odds }}
-                                                    {% else %}
-                                                        --
-                                                    {% endif %}
-                                                </span>
-                                                <span class="confidence">
-                                                    {% if sbgame.home_confidence %}{{ sbgame.home_confidence }}%{% else %}--{% endif %}
-                                                </span>
-                                                <span class="ev {% if home_ev > 0 %}positive{% else %}negative{% endif %}">
-                                                    {{ sbgame.home_team_ev if sbgame.home_team_ev else '--' }}
-                                                </span>
-                                            </div>
-                                            <div class="confidence-bar" style="--bar: {{ home_conf }}%;">
-                                                <span></span>
-                                            </div>
-                                        </div>
-                                    </div>
-                                {% else %}
-                                    <div class="empty-book">No odds for this matchup.</div>
-                                {% endif %}
-                            </div>
-                            {% endfor %}
-                        </div>
-                    </article>
-                    {% endfor %}
                 </div>
-            </section>
+                <button class="run-btn" id="runBtn" onclick="runModel()">Run Model Now</button>
+            </div>
 
-            <section id="stack" class="section">
-                <div class="section-header">
-                    <div>
-                        <div class="eyebrow">Model stack</div>
-                        <h2>From raw stats to ready-to-bet predictions.</h2>
-                        <p>A compact pipeline that goes from daily NBA data to live picks.</p>
-                    </div>
-                    <div class="chip">XGBoost + Neural Net</div>
+            {% if predictions %}
+            {% set trades = predictions|selectattr('side')|list %}
+            {% set passes = predictions|rejectattr('side')|list %}
+            <div class="summary-cards">
+                <div class="summary-card">
+                    <div class="val">{{ predictions|length }}</div>
+                    <div class="lbl">Games Scanned</div>
                 </div>
-                <div class="feature-grid">
-                    <div class="feature-card reveal">
-                        <h3>Ingest</h3>
-                        <p>Daily team stats and sportsbook odds flow into SQLite datasets.</p>
-                    </div>
-                    <div class="feature-card reveal" data-delay="90">
-                        <h3>Feature build</h3>
-                        <p>Matchups combine team baselines, days of rest, and totals data.</p>
-                    </div>
-                    <div class="feature-card reveal" data-delay="180">
-                        <h3>Train</h3>
-                        <p>XGBoost and neural nets learn win probabilities and totals leans.</p>
-                    </div>
-                    <div class="feature-card reveal" data-delay="270">
-                        <h3>Deploy</h3>
-                        <p>Live odds run through models to surface EV and Kelly sizing.</p>
-                    </div>
+                <div class="summary-card">
+                    <div class="val" style="color: #22c55e;">{{ trades|length }}</div>
+                    <div class="lbl">Trades Found</div>
                 </div>
-            </section>
+                <div class="summary-card">
+                    <div class="val">{{ passes|length }}</div>
+                    <div class="lbl">Pass</div>
+                </div>
+            </div>
+
+            <div class="game-grid">
+                {% for p in predictions %}
+                <article class="game-card {% if p.side %}has-edge side-{{ p.side }}{% endif %}">
+                    <div class="game-matchup">
+                        <div class="team-names">
+                            <span class="away">{{ p.away_team }}</span>
+                            <span class="at">@</span>
+                            <span>{{ p.home_team }}</span>
+                        </div>
+                        {% if p.side == 'yes' %}
+                        <span class="side-badge yes">BUY YES</span>
+                        {% elif p.side == 'no' %}
+                        <span class="side-badge no">BUY NO</span>
+                        {% else %}
+                        <span class="side-badge pass">PASS</span>
+                        {% endif %}
+                    </div>
+
+                    <div class="prob-row">
+                        <span style="font-size:0.75rem; color:rgba(255,255,255,0.4); min-width:45px;">Model</span>
+                        <div class="prob-bar-wrap">
+                            <div class="prob-bar" style="width: {{ (p.model_prob * 100)|round(0) }}%;"></div>
+                        </div>
+                        <span class="prob-label">{{ (p.model_prob * 100)|round(1) }}%</span>
+                    </div>
+                    <div class="prob-row">
+                        <span style="font-size:0.75rem; color:rgba(255,255,255,0.4); min-width:45px;">Kalshi</span>
+                        <div class="prob-bar-wrap">
+                            <div class="prob-bar" style="width: {{ p.kalshi_price }}%; background: rgba(255,255,255,0.15);"></div>
+                        </div>
+                        <span class="market-label">{{ p.kalshi_price }}c</span>
+                    </div>
+
+                    <div class="stats-grid">
+                        <div class="stat">
+                            <div class="stat-label">Edge</div>
+                            <div class="stat-value {% if p.edge > 0 %}positive{% elif p.edge < 0 %}negative{% endif %}">
+                                {{ '%+.1f'|format(p.edge * 100) }}%
+                            </div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-label">KL Div</div>
+                            <div class="stat-value">{{ '%.3f'|format(p.kl_divergence) }}</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-label">Kelly Size</div>
+                            <div class="stat-value">
+                                {% if p.kelly_size_cents > 0 %}${{ '%.2f'|format(p.kelly_size_cents / 100) }}{% else %}—{% endif %}
+                            </div>
+                        </div>
+                    </div>
+
+                    {% if p.stoikov_price %}
+                    <div class="stats-grid" style="margin-top: 0.5rem;">
+                        <div class="stat">
+                            <div class="stat-label">Stoikov Price</div>
+                            <div class="stat-value">{{ p.stoikov_price }}c</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-label">Savings</div>
+                            <div class="stat-value positive">{{ p.stoikov_improvement }}c</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-label">Ticker</div>
+                            <div class="stat-value" style="font-size:0.7rem;">{{ p.ticker[:15] }}</div>
+                        </div>
+                    </div>
+                    {% endif %}
+
+                    {% if p.injuries_home > 0 or p.injuries_away > 0 %}
+                    <div class="injury-note">
+                        Injuries:
+                        {% if p.injuries_home > 0 %}<span>{{ p.home_team }} {{ p.injuries_home }} OUT</span>{% endif %}
+                        {% if p.injuries_home > 0 and p.injuries_away > 0 %} | {% endif %}
+                        {% if p.injuries_away > 0 %}<span>{{ p.away_team }} {{ p.injuries_away }} OUT</span>{% endif %}
+                    </div>
+                    {% endif %}
+                </article>
+                {% endfor %}
+            </div>
+
+            {% else %}
+            <div class="no-data">
+                <h3>No predictions yet</h3>
+                <p>Click "Run Model Now" to generate predictions for today's games.</p>
+                <p style="font-size: 0.85rem; margin-top: 1rem;">The model runs automatically at 6:30 PM ET daily.</p>
+            </div>
+            {% endif %}
         </main>
 
         <footer class="footer">
-            Built for sharper NBA decisions. Data + models update daily.
+            NBA Kalshi Edge Lab — Ensemble + Bayesian + KL Divergence + Stoikov
         </footer>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="{{ url_for('static', filename='app.js') }}"></script>
-    {% include 'team_modal.html' %}
-    {% include 'player_modal.html' %}
+    <script>
+    function runModel() {
+        const btn = document.getElementById('runBtn');
+        btn.disabled = true;
+        btn.textContent = 'Running...';
+        fetch('/api/run-model', { method: 'POST' })
+            .then(r => r.json())
+            .then(data => {
+                btn.textContent = 'Model running — refreshing in 90s...';
+                setTimeout(() => { window.location.reload(); }, 90000);
+            })
+            .catch(() => {
+                btn.disabled = false;
+                btn.textContent = 'Run Model Now';
+            });
+    }
+    </script>
 </body>
 </html>

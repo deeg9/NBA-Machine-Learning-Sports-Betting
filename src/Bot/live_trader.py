@@ -28,6 +28,7 @@ ENSEMBLE_PATH = BASE_DIR / "Models" / "Ensemble_Models" / "stacked_ensemble_ML.p
 CALIBRATION_PATH = BASE_DIR / "Models" / "Ensemble_Models" / "stacked_ensemble_ML_calibration.pkl"
 SCHEDULE_PATH = BASE_DIR / "Data" / "nba-2025-UTC.csv"
 LOG_DIR = BASE_DIR / "logs"
+INJURY_CACHE_PATH = LOG_DIR / "injury_cache.json"
 
 DATA_URL = (
     "https://stats.nba.com/stats/leaguedashteamstats?"
@@ -45,6 +46,28 @@ MAX_POSITION_CENTS = int(os.getenv("MAX_POSITION_CENTS", "200"))
 DAILY_LOSS_LIMIT_CENTS = int(os.getenv("DAILY_LOSS_LIMIT_CENTS", "500"))
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
+
+# Module toggles
+ENABLE_BAYESIAN_UPDATES = os.getenv("ENABLE_BAYESIAN_UPDATES", "false").lower() == "true"
+ENABLE_KL_DIVERGENCE = os.getenv("ENABLE_KL_DIVERGENCE", "false").lower() == "true"
+ENABLE_STOIKOV_EXECUTION = os.getenv("ENABLE_STOIKOV_EXECUTION", "false").lower() == "true"
+
+# Bayesian config
+BAYESIAN_CONFIG = {
+    "use_line_movement": os.getenv("BAYESIAN_USE_LINE_MOVEMENT", "true").lower() == "true",
+    "use_injuries": os.getenv("BAYESIAN_USE_INJURIES", "true").lower() == "true",
+    "use_reverse_line": os.getenv("BAYESIAN_USE_REVERSE_LINE", "true").lower() == "true",
+    "line_strength": float(os.getenv("BAYESIAN_LINE_STRENGTH", "1.0")),
+    "injury_strength": float(os.getenv("BAYESIAN_INJURY_STRENGTH", "1.0")),
+    "max_total_shift": float(os.getenv("BAYESIAN_MAX_SHIFT", "0.15")),
+}
+
+# KL Divergence config
+KL_THRESHOLD = float(os.getenv("KL_THRESHOLD", "0.05"))
+
+# Stoikov config
+STOIKOV_GAMMA = float(os.getenv("STOIKOV_GAMMA", "0.1"))
+STOIKOV_MAX_IMPROVEMENT = int(os.getenv("STOIKOV_MAX_IMPROVEMENT", "5"))
 
 
 # ── Ensemble loading ─────────────────────────────────────────────────────
@@ -226,6 +249,32 @@ def find_edge(model_prob, market_price_cents):
 
 # ── Trade execution ───────────────────────────────────────────────────────
 
+def get_position_for_ticker(positions, ticker):
+    """Extract net position count for a specific ticker."""
+    for pos in positions:
+        if hasattr(pos, "ticker") and pos.ticker == ticker:
+            yes_count = getattr(pos, "yes_count", 0) or 0
+            no_count = getattr(pos, "no_count", 0) or 0
+            return yes_count - no_count
+        if isinstance(pos, dict) and pos.get("ticker") == ticker:
+            return pos.get("yes_count", 0) - pos.get("no_count", 0)
+    return 0
+
+
+def parse_close_time(close_time_str):
+    """Parse Kalshi close_time string into datetime."""
+    if close_time_str is None:
+        return datetime.now() + timedelta(hours=4)  # default 4h
+    if isinstance(close_time_str, datetime):
+        return close_time_str
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(close_time_str, fmt)
+        except ValueError:
+            continue
+    return datetime.now() + timedelta(hours=4)
+
+
 def execute_trades(edges, client, dry_run=False):
     """Place limit orders for games with sufficient edge.
 
@@ -233,7 +282,7 @@ def execute_trades(edges, client, dry_run=False):
     ----------
     edges : list[dict]
         Each dict has: ticker, home_team, away_team, model_prob,
-        market_price, edge_info (from find_edge).
+        market_price, close_time, edge_info (from find_edge).
     client : KalshiClient
     dry_run : bool
         If True, log but don't place orders.
@@ -246,6 +295,9 @@ def execute_trades(edges, client, dry_run=False):
     results = []
     daily_exposure = 0
 
+    # Pre-fetch positions once if Stoikov is enabled
+    positions = client.get_positions() if ENABLE_STOIKOV_EXECUTION else []
+
     for trade in edges:
         edge_info = trade["edge_info"]
         if edge_info["side"] is None or edge_info["recommended_size_cents"] <= 0:
@@ -257,11 +309,38 @@ def execute_trades(edges, client, dry_run=False):
             continue
 
         side = edge_info["side"]
-        price_cents = (
-            trade["market_price"]
-            if side == "yes"
-            else 100 - trade["market_price"]
-        )
+
+        # Stoikov execution: calculate optimal limit price
+        if ENABLE_STOIKOV_EXECUTION:
+            from src.Utils.StoikovExecution import optimal_limit_price
+
+            current_pos = get_position_for_ticker(positions, trade["ticker"])
+            close_time = parse_close_time(trade.get("close_time"))
+            hours_left = max(0, (close_time - datetime.now()).total_seconds() / 3600)
+
+            orderbook = client.get_orderbook(trade["ticker"], depth=5)
+            exec_result = optimal_limit_price(
+                model_prob=trade["model_prob"],
+                current_position=current_pos,
+                time_to_close_hours=hours_left,
+                orderbook=orderbook,
+                side=side,
+                gamma=STOIKOV_GAMMA,
+                max_improvement=STOIKOV_MAX_IMPROVEMENT,
+            )
+            price_cents = exec_result["optimal_price"]
+            naive_price = trade["market_price"] if side == "yes" else 100 - trade["market_price"]
+            if exec_result["improvement_cents"] > 0:
+                print(f"  [Stoikov] {trade['ticker']}: naive={naive_price}c "
+                      f"optimal={price_cents}c (saving {exec_result['improvement_cents']}c, "
+                      f"fill_prob={exec_result['fill_probability']:.0%})")
+        else:
+            price_cents = (
+                trade["market_price"]
+                if side == "yes"
+                else 100 - trade["market_price"]
+            )
+
         count = max(1, edge_info["recommended_size_cents"] // price_cents)
 
         result = {
@@ -330,6 +409,39 @@ def log_trades(results):
     print(f"[Trader] Logged {len(results)} trades to {log_path}")
 
 
+# ── Injury data ──────────────────────────────────────────────────────────
+
+def load_injury_snapshot():
+    """Fetch current injuries from ESPN and cache to disk for diffing."""
+    from src.DataProviders.PlayerDataProvider import fetch_injury_data
+    injury_df = fetch_injury_data()
+    if not injury_df.empty:
+        LOG_DIR.mkdir(exist_ok=True)
+        injury_df.to_json(INJURY_CACHE_PATH, orient="records", date_format="iso")
+    return injury_df
+
+
+def load_previous_injury_snapshot():
+    """Load the cached injury snapshot from the previous run."""
+    if not INJURY_CACHE_PATH.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_json(INJURY_CACHE_PATH, orient="records")
+    except Exception:
+        return pd.DataFrame()
+
+
+def compute_injury_delta(home_team, away_team, current_df, previous_df):
+    """Diff current vs previous injury snapshots to get new OUT players."""
+    from src.Features.injury_features import compute_live_injury_counts
+    current = compute_live_injury_counts(home_team, away_team, current_df)
+    previous = compute_live_injury_counts(home_team, away_team, previous_df)
+    return {
+        "home_out_delta": max(0, current["Injuries_Out_Home"] - previous["Injuries_Out_Home"]),
+        "away_out_delta": max(0, current["Injuries_Out_Away"] - previous["Injuries_Out_Away"]),
+    }
+
+
 # ── Main entry ────────────────────────────────────────────────────────────
 
 def run(dry_run=False):
@@ -352,6 +464,15 @@ def run(dry_run=False):
           f"Max/game: ${MAX_POSITION_CENTS / 100:.2f} | "
           f"Daily limit: ${DAILY_LOSS_LIMIT_CENTS / 100:.2f}")
     print(f"  Kelly fraction: {KELLY_FRACTION} | Min edge: {MIN_EDGE:.0%}")
+    modules = []
+    if ENABLE_BAYESIAN_UPDATES:
+        modules.append("Bayesian")
+    if ENABLE_KL_DIVERGENCE:
+        modules.append("KL-Divergence")
+    if ENABLE_STOIKOV_EXECUTION:
+        modules.append("Stoikov")
+    if modules:
+        print(f"  Modules: {', '.join(modules)}")
     print("=" * 60)
 
     # 1. Load ensemble
@@ -375,6 +496,17 @@ def run(dry_run=False):
     # 4. Initialize Kalshi client
     client = KalshiClient()
 
+    # 4b. Fetch injury data for Bayesian updates
+    if ENABLE_BAYESIAN_UPDATES and BAYESIAN_CONFIG["use_injuries"]:
+        print("[Trader] Fetching injury data from ESPN...")
+        previous_injuries = load_previous_injury_snapshot()
+        current_injuries = load_injury_snapshot()
+        print(f"[Trader] {len(current_injuries)} injury records loaded"
+              f" ({len(previous_injuries)} cached from previous run)")
+    else:
+        current_injuries = pd.DataFrame()
+        previous_injuries = pd.DataFrame()
+
     # 5. Get Kalshi NBA markets for today
     print("[Trader] Fetching Kalshi NBA markets...")
     markets = client.get_nba_game_markets(today.strftime("%Y-%m-%d"))
@@ -385,6 +517,7 @@ def run(dry_run=False):
     print(f"[Trader] Found {len(markets)} NBA markets")
 
     # 6. For each market, build features and predict
+    price_cache = {}  # {ticker: previous_price} for Bayesian line movement
     edges = []
     for market in markets:
         home_team = market["home_team"]
@@ -406,6 +539,29 @@ def run(dry_run=False):
         if market_price is None or market_price <= 0 or market_price >= 100:
             continue
 
+        # Bayesian update: adjust model_prob with real-time signals
+        if ENABLE_BAYESIAN_UPDATES:
+            from src.Utils.BayesianUpdater import update_probability
+
+            orderbook = client.get_orderbook(market["ticker"])
+            snapshot = {
+                "current_price": market_price,
+                "previous_price": price_cache.get(market["ticker"], market_price),
+                "yes_volume": orderbook.get("yes_volume"),
+                "no_volume": orderbook.get("no_volume"),
+            }
+            prior = model_prob
+            inj_delta = compute_injury_delta(
+                home_team, away_team, current_injuries, previous_injuries
+            ) if not current_injuries.empty else None
+            model_prob, update_log = update_probability(
+                model_prob, snapshot, inj_delta, BAYESIAN_CONFIG,
+            )
+            price_cache[market["ticker"]] = market_price
+            if update_log:
+                print(f"  [Bayesian] {home_team}: {prior:.1%} → {model_prob:.1%} "
+                      f"({len(update_log)} signals)")
+
         # Compute edge
         edge_info = find_edge(model_prob, market_price)
 
@@ -421,11 +577,34 @@ def run(dry_run=False):
             "away_team": away_team,
             "model_prob": model_prob,
             "market_price": market_price,
+            "close_time": market.get("close_time"),
             "edge_info": edge_info,
         })
 
-    # 7. Execute trades
+    # 7. KL Divergence: rank trades by information-theoretic mispricing
+    if ENABLE_KL_DIVERGENCE and edges:
+        from src.Utils.KLDivergence import detect_mispricing
+
+        kl_results = detect_mispricing(
+            [{"ticker": e["ticker"], "model_prob": e["model_prob"],
+              "market_price_cents": e["market_price"]} for e in edges],
+            threshold=KL_THRESHOLD,
+        )
+        kl_map = {r["ticker"]: r for r in kl_results}
+        for e in edges:
+            kl_info = kl_map.get(e["ticker"])
+            if kl_info:
+                e["kl_divergence"] = kl_info["kl_divergence"]
+                e["kl_confirmed"] = True
+                print(f"  [KL] {e['ticker']}: KL={kl_info['kl_divergence']:.4f} "
+                      f"{kl_info['direction']}")
+
+    # 8. Execute trades
     tradeable = [e for e in edges if e["edge_info"]["side"] is not None]
+    if ENABLE_KL_DIVERGENCE:
+        tradeable.sort(key=lambda e: (
+            not e.get("kl_confirmed", False), -e["edge_info"]["edge"]
+        ))
     if tradeable:
         print(f"\n[Trader] {len(tradeable)} games with edge >= {MIN_EDGE:.0%}")
         results = execute_trades(tradeable, client, dry_run=dry_run)
@@ -441,6 +620,143 @@ def run(dry_run=False):
         }])
 
     print("\n[Trader] Done.")
+
+
+def scan_games():
+    """Run the full prediction pipeline and return structured results for the dashboard.
+
+    Returns list of dicts with all prediction data for every game (not just tradeable ones).
+    Also saves to logs/scan_YYYY-MM-DD.json.
+    """
+    from src.DataProviders.KalshiClient import KalshiClient
+    from src.Utils.tools import get_json_data, to_data_frame
+
+    base_learners, meta_learner, sigmoid_cal, scaler, model_names, scaled_models = (
+        load_ensemble()
+    )
+    stats_json = get_json_data(DATA_URL)
+    df = to_data_frame(stats_json)
+    schedule_df = pd.read_csv(
+        SCHEDULE_PATH, parse_dates=["Date"], date_format="%d/%m/%Y %H:%M"
+    )
+    today = datetime.today()
+    client = KalshiClient()
+
+    # Injury data
+    if ENABLE_BAYESIAN_UPDATES and BAYESIAN_CONFIG["use_injuries"]:
+        previous_injuries = load_previous_injury_snapshot()
+        current_injuries = load_injury_snapshot()
+    else:
+        current_injuries = pd.DataFrame()
+        previous_injuries = pd.DataFrame()
+
+    markets = client.get_nba_game_markets(today.strftime("%Y-%m-%d"))
+    if not markets:
+        return []
+
+    predictions = []
+    price_cache = {}
+
+    for market in markets:
+        home_team = market["home_team"]
+        away_team = market["away_team"]
+
+        features = build_game_features(home_team, away_team, df, schedule_df, today)
+        if features is None:
+            continue
+
+        data = features.reshape(1, -1)
+        model_prob = float(ensemble_predict(
+            data, base_learners, meta_learner, sigmoid_cal, scaler,
+            model_names, scaled_models,
+        )[0])
+
+        market_price = market["yes_price"]
+        if market_price is None or market_price <= 0 or market_price >= 100:
+            continue
+
+        # Bayesian update
+        bayesian_log = []
+        injuries_home = 0
+        injuries_away = 0
+        if ENABLE_BAYESIAN_UPDATES:
+            from src.Utils.BayesianUpdater import update_probability
+
+            orderbook = client.get_orderbook(market["ticker"])
+            snapshot = {
+                "current_price": market_price,
+                "previous_price": price_cache.get(market["ticker"], market_price),
+                "yes_volume": orderbook.get("yes_volume"),
+                "no_volume": orderbook.get("no_volume"),
+            }
+            inj_delta = None
+            if not current_injuries.empty:
+                inj_delta = compute_injury_delta(
+                    home_team, away_team, current_injuries, previous_injuries
+                )
+                injuries_home = inj_delta.get("home_out_delta", 0)
+                injuries_away = inj_delta.get("away_out_delta", 0)
+            model_prob, bayesian_log = update_probability(
+                model_prob, snapshot, inj_delta, BAYESIAN_CONFIG,
+            )
+            price_cache[market["ticker"]] = market_price
+
+        # Edge
+        edge_info = find_edge(model_prob, market_price)
+
+        # KL divergence
+        kl_score = 0.0
+        if ENABLE_KL_DIVERGENCE:
+            from src.Utils.KLDivergence import symmetric_kl
+            kl_score = symmetric_kl(model_prob, market_price / 100.0)
+
+        # Stoikov
+        stoikov_price = None
+        stoikov_improvement = 0
+        if ENABLE_STOIKOV_EXECUTION and edge_info["side"]:
+            from src.Utils.StoikovExecution import optimal_limit_price as stoikov_calc
+
+            close_time = parse_close_time(market.get("close_time"))
+            hours_left = max(0, (close_time - datetime.now()).total_seconds() / 3600)
+            orderbook = client.get_orderbook(market["ticker"], depth=5)
+            exec_result = stoikov_calc(
+                model_prob=model_prob,
+                current_position=0,
+                time_to_close_hours=hours_left,
+                orderbook=orderbook,
+                side=edge_info["side"],
+                gamma=STOIKOV_GAMMA,
+                max_improvement=STOIKOV_MAX_IMPROVEMENT,
+            )
+            stoikov_price = exec_result["optimal_price"]
+            stoikov_improvement = exec_result["improvement_cents"]
+
+        predictions.append({
+            "ticker": market["ticker"],
+            "home_team": home_team,
+            "away_team": away_team,
+            "model_prob": round(model_prob, 4),
+            "kalshi_price": market_price,
+            "edge": round(model_prob - market_price / 100.0, 4),
+            "side": edge_info["side"],
+            "kelly_size_cents": edge_info["recommended_size_cents"],
+            "kl_divergence": round(kl_score, 4),
+            "bayesian_log": bayesian_log,
+            "injuries_home": injuries_home,
+            "injuries_away": injuries_away,
+            "stoikov_price": stoikov_price,
+            "stoikov_improvement": stoikov_improvement,
+            "close_time": market.get("close_time"),
+            "timestamp": datetime.now().isoformat(),
+        })
+
+    # Save full scan
+    LOG_DIR.mkdir(exist_ok=True)
+    scan_path = LOG_DIR / f"scan_{today.strftime('%Y-%m-%d')}.json"
+    with open(scan_path, "w") as f:
+        json.dump(predictions, f, indent=2)
+
+    return predictions
 
 
 if __name__ == "__main__":

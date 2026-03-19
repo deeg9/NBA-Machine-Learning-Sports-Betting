@@ -7,12 +7,19 @@ Trains the stacked ensemble on all pre-2025-26 data, then walks through each
 game day applying the same Kelly criterion logic from live_trader.py with a
 $10 bankroll.
 
+Supports optional modules:
+    --bayesian          Apply Bayesian injury updates to model probabilities
+    --kl                Compute KL divergence and report bucketed statistics
+    --stoikov           Use Stoikov execution model for limit order pricing
+
 Usage:
     python backtest_kalshi.py
     python backtest_kalshi.py --bankroll 10.00 --kelly-fraction 0.25
+    python backtest_kalshi.py --bayesian --kl --stoikov
 """
 
 import argparse
+import random
 import sqlite3
 from collections import defaultdict
 from importlib import import_module
@@ -35,6 +42,7 @@ SCALED_MODELS = _ensemble_mod.SCALED_MODELS
 BASE_DIR = Path(__file__).resolve().parent
 DATASET_DB = BASE_DIR / "Data" / "dataset.sqlite"
 ODDS_DB = BASE_DIR / "Data" / "OddsData.sqlite"
+INJURY_DB = BASE_DIR / "Data" / "InjuryData.sqlite"
 
 TARGET_COLUMN = "Home-Team-Win"
 DATE_COLUMN = "Date"
@@ -72,6 +80,36 @@ def load_odds_2025():
             "ML_Away": row["ML_Away"],
         }
     return odds_map
+
+
+def load_injury_db():
+    """Load all injury data from InjuryData.sqlite for backtest use."""
+    if not INJURY_DB.exists():
+        return pd.DataFrame()
+    try:
+        from src.DataProviders.PlayerDataProvider import load_all_injury_data
+        return load_all_injury_data(INJURY_DB)
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_injuries_for_date(injury_db, date_str):
+    """Get injury snapshot closest to (but not after) a given date."""
+    if injury_db.empty or "Date" not in injury_db.columns:
+        return pd.DataFrame()
+    # Ensure Date column is datetime
+    if not pd.api.types.is_datetime64_any_dtype(injury_db["Date"]):
+        injury_db = injury_db.copy()
+        injury_db["Date"] = pd.to_datetime(injury_db["Date"], errors="coerce")
+    date = pd.to_datetime(date_str, utc=True)
+    dates_col = injury_db["Date"]
+    if dates_col.dt.tz is None:
+        dates_col = dates_col.dt.tz_localize("UTC")
+    before = injury_db[dates_col <= date]
+    if before.empty:
+        return pd.DataFrame()
+    # Latest entry per player
+    return before.sort_values("Date").groupby("Player").last().reset_index()
 
 
 def extract_feature_cols(df):
@@ -215,11 +253,16 @@ def compute_trade(model_prob, contract_price, bankroll_cents,
 
 def run_backtest(bankroll_dollars=10.0, max_position_dollars=2.0,
                  daily_loss_dollars=5.0, min_edge=0.05, kelly_fraction=0.25,
-                 dataset="dataset_enhanced", quiet=False):
+                 dataset="dataset_enhanced", quiet=False,
+                 use_bayesian=False, use_kl=False, use_stoikov=False,
+                 stoikov_gamma=0.1, stoikov_max_improvement=5, seed=42):
     bankroll_cents = int(bankroll_dollars * 100)
     max_pos = int(max_position_dollars * 100)
     daily_limit = int(daily_loss_dollars * 100)
     starting_bankroll = bankroll_cents
+
+    # Seed for reproducible Stoikov fill simulation
+    random.seed(seed)
 
     def _print(*args, **kwargs):
         if not quiet:
@@ -234,6 +277,15 @@ def run_backtest(bankroll_dollars=10.0, max_position_dollars=2.0,
     _print(f"  Kelly fraction:     {kelly_fraction}")
     _print(f"  Min edge:           {min_edge:.0%}")
     _print(f"  Dataset:            {dataset}")
+    modules = []
+    if use_bayesian:
+        modules.append("Bayesian")
+    if use_kl:
+        modules.append("KL-Divergence")
+    if use_stoikov:
+        modules.append(f"Stoikov(γ={stoikov_gamma}, max={stoikov_max_improvement}c)")
+    if modules:
+        _print(f"  Modules:            {', '.join(modules)}")
     _print("=" * 65)
 
     # Load data
@@ -260,7 +312,7 @@ def run_backtest(bankroll_dollars=10.0, max_position_dollars=2.0,
     # Train ensemble
     _print("\nTraining stacked ensemble (6 base learners + meta)...")
     fitted, meta_learner, sigmoid_cal, scaler, model_names = train_ensemble(
-        X_train, y_train
+        X_train, y_train, seed=seed,
     )
     _print(f"Base learners: {model_names}")
 
@@ -277,6 +329,13 @@ def run_backtest(bankroll_dollars=10.0, max_position_dollars=2.0,
     _print("Loading 2025-26 odds...")
     odds_map = load_odds_2025()
     _print(f"Loaded {len(odds_map)} odds rows")
+
+    # Load injury data if Bayesian mode
+    injury_db = pd.DataFrame()
+    if use_bayesian:
+        _print("Loading injury data for Bayesian updates...")
+        injury_db = load_injury_db()
+        _print(f"Loaded {len(injury_db)} injury records")
 
     # ── Day-by-day simulation ─────────────────────────────────────────────
     _print("\n" + "-" * 65)
@@ -303,6 +362,11 @@ def run_backtest(bankroll_dollars=10.0, max_position_dollars=2.0,
     trajectory = [bankroll_cents]
     monthly_pnl = defaultdict(float)
     all_edges = []
+    all_trade_details = []  # for KL bucketing
+    stoikov_savings_total = 0
+    stoikov_fills = 0
+    stoikov_misses = 0
+    bayesian_adjustments = 0
     busted = False
 
     for date_str in sorted(date_groups.keys()):
@@ -311,11 +375,17 @@ def run_backtest(bankroll_dollars=10.0, max_position_dollars=2.0,
         day_pnl = 0
         day_exposure = 0
 
+        # Load injury snapshot for this date (once per day)
+        if use_bayesian and not injury_db.empty:
+            day_injuries = get_injuries_for_date(injury_db, date_str)
+        else:
+            day_injuries = pd.DataFrame()
+
         for i in indices:
             home = home_names.iloc[i]
             away = away_names.iloc[i]
             actual_home_win = bool(y_test[i] == 1)
-            prob_home = model_probs[i]
+            prob_home = float(model_probs[i])
 
             # Get odds → Kalshi price
             key = (date_str, home, away)
@@ -329,6 +399,33 @@ def run_backtest(bankroll_dollars=10.0, max_position_dollars=2.0,
             if contract_price is None or contract_price <= 0 or contract_price >= 100:
                 continue
 
+            # ── Bayesian injury update ────────────────────────────────
+            if use_bayesian and not day_injuries.empty:
+                from src.Utils.BayesianUpdater import update_probability
+                from src.Features.injury_features import compute_live_injury_counts
+
+                counts = compute_live_injury_counts(home, away, day_injuries)
+                inj_delta = {
+                    "home_out_delta": counts["Injuries_Out_Home"],
+                    "away_out_delta": counts["Injuries_Out_Away"],
+                }
+                if inj_delta["home_out_delta"] > 0 or inj_delta["away_out_delta"] > 0:
+                    prob_home, _ = update_probability(
+                        prob_home, None, inj_delta,
+                        {"use_line_movement": False, "use_injuries": True,
+                         "use_reverse_line": False, "injury_strength": 1.0,
+                         "max_total_shift": 0.15},
+                        backtest_mode=True,
+                    )
+                    bayesian_adjustments += 1
+
+            # ── KL divergence score ───────────────────────────────────
+            kl_score = 0.0
+            if use_kl:
+                from src.Utils.KLDivergence import symmetric_kl
+                market_implied = contract_price / 100.0
+                kl_score = symmetric_kl(prob_home, market_implied)
+
             # Compute trade
             trade = compute_trade(
                 prob_home, contract_price, bankroll_cents,
@@ -336,6 +433,38 @@ def run_backtest(bankroll_dollars=10.0, max_position_dollars=2.0,
             )
             if trade is None:
                 continue
+
+            # ── Stoikov execution ─────────────────────────────────────
+            stoikov_improvement = 0
+            if use_stoikov:
+                from src.Utils.StoikovExecution import optimal_limit_price
+
+                exec_result = optimal_limit_price(
+                    model_prob=prob_home,
+                    current_position=0,
+                    time_to_close_hours=4.0,
+                    orderbook={
+                        "yes_ask": trade["price"] if trade["side"] == "yes" else (100 - trade["price"]),
+                        "no_ask": (100 - trade["price"]) if trade["side"] == "yes" else trade["price"],
+                    },
+                    side=trade["side"],
+                    gamma=stoikov_gamma,
+                    max_improvement=stoikov_max_improvement,
+                )
+                fill_prob = exec_result["fill_probability"]
+
+                # Simulate probabilistic fill
+                if random.random() > fill_prob:
+                    stoikov_misses += 1
+                    continue  # order didn't fill
+
+                stoikov_fills += 1
+                improved_price = exec_result["optimal_price"]
+                stoikov_improvement = trade["price"] - improved_price
+                if stoikov_improvement > 0:
+                    stoikov_savings_total += stoikov_improvement * trade["count"]
+                    trade["price"] = improved_price
+                    trade["cost_cents"] = trade["count"] * improved_price
 
             # Daily limit check
             if day_exposure + trade["cost_cents"] > daily_limit:
@@ -357,6 +486,15 @@ def run_backtest(bankroll_dollars=10.0, max_position_dollars=2.0,
             else:
                 # Loss = cost of contracts
                 profit = -trade["cost_cents"]
+
+            # Track for KL bucketing
+            if use_kl:
+                all_trade_details.append({
+                    "kl": kl_score,
+                    "edge": trade["edge"],
+                    "won": won,
+                    "profit": profit,
+                })
 
             bankroll_cents += profit
             day_pnl += profit
@@ -415,23 +553,58 @@ def run_backtest(bankroll_dollars=10.0, max_position_dollars=2.0,
         _print(f"  Avg edge on bets:    {np.mean(all_edges):.1%}")
     _print(f"  Games with edge:     {total_games_with_edge}")
 
+    # Module-specific stats
+    if use_bayesian:
+        _print(f"\n  Bayesian Updates:")
+        _print(f"    Games with injury adjustments: {bayesian_adjustments}")
+
+    if use_stoikov:
+        _print(f"\n  Stoikov Execution:")
+        _print(f"    Orders filled:     {stoikov_fills}")
+        _print(f"    Orders missed:     {stoikov_misses}")
+        fill_rate = stoikov_fills / (stoikov_fills + stoikov_misses) if (stoikov_fills + stoikov_misses) > 0 else 0
+        _print(f"    Fill rate:         {fill_rate:.0%}")
+        _print(f"    Total savings:     ${stoikov_savings_total / 100:.2f}")
+
     if monthly_pnl:
         _print(f"\n  Monthly breakdown:")
         for month in sorted(monthly_pnl):
             _print(f"    {month}:  ${monthly_pnl[month] / 100:+.2f}")
 
+    # KL Divergence bucketed analysis
+    if use_kl and all_trade_details:
+        _print(f"\n  KL Divergence Analysis:")
+        _print(f"  {'KL Bucket':<18} {'Bets':>5} {'Wins':>5} {'Win%':>6} "
+               f"{'Avg Edge':>9} {'P&L':>10}")
+        _print(f"  {'-'*18} {'-'*5} {'-'*5} {'-'*6} {'-'*9} {'-'*10}")
+
+        for bucket_name, lo, hi in [("Low (<0.05)", 0, 0.05),
+                                      ("Med (0.05-0.15)", 0.05, 0.15),
+                                      ("High (>0.15)", 0.15, 999)]:
+            bucket = [t for t in all_trade_details if lo <= t["kl"] < hi]
+            if not bucket:
+                _print(f"  {bucket_name:<18} {'—':>5}")
+                continue
+            b_bets = len(bucket)
+            b_wins = sum(1 for t in bucket if t["won"])
+            b_win_pct = b_wins / b_bets * 100
+            b_avg_edge = np.mean([t["edge"] for t in bucket])
+            b_pnl = sum(t["profit"] for t in bucket)
+            _print(f"  {bucket_name:<18} {b_bets:>5} {b_wins:>5} {b_win_pct:>5.1f}% "
+                   f"{b_avg_edge:>8.1%} ${b_pnl / 100:>+9.2f}")
+
     # Sparkline
     if len(trajectory) > 1:
         steps = min(len(trajectory), 30)
-        indices = [int(i * (len(trajectory) - 1) / (steps - 1)) for i in range(steps)]
-        vals = [trajectory[i] / 100 for i in indices]
+        idx_list = [int(i * (len(trajectory) - 1) / (steps - 1)) for i in range(steps)]
+        vals = [trajectory[i] / 100 for i in idx_list]
         lo, hi = min(vals), max(vals)
         spread = hi - lo if hi != lo else 1
         chars = " _.-~*^"
         line = ""
         for v in vals:
-            idx = int((v - lo) / spread * (len(chars) - 1))
-            line += chars[min(idx, len(chars) - 1)]
+            ci = int((v - lo) / spread * (len(chars) - 1))
+            line += chars[min(ci, len(chars) - 1)]
         _print(f"\n  Bankroll trajectory:  [{line}]")
         _print(f"                        ${lo:.2f} → ${hi:.2f}")
 
@@ -461,6 +634,21 @@ if __name__ == "__main__":
                         help="Kelly fraction (default: 0.25)")
     parser.add_argument("--dataset", default="dataset_enhanced",
                         help="Dataset table (default: dataset_enhanced)")
+
+    # Module flags
+    parser.add_argument("--bayesian", action="store_true",
+                        help="Enable Bayesian injury updates")
+    parser.add_argument("--kl", action="store_true",
+                        help="Enable KL divergence ranking and bucketed stats")
+    parser.add_argument("--stoikov", action="store_true",
+                        help="Enable Stoikov execution pricing")
+    parser.add_argument("--stoikov-gamma", type=float, default=0.1,
+                        help="Stoikov risk aversion parameter (default: 0.1)")
+    parser.add_argument("--stoikov-max-improvement", type=int, default=5,
+                        help="Max cents below market to bid (default: 5)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42)")
+
     args = parser.parse_args()
 
     run_backtest(
@@ -470,4 +658,10 @@ if __name__ == "__main__":
         min_edge=args.min_edge,
         kelly_fraction=args.kelly_fraction,
         dataset=args.dataset,
+        use_bayesian=args.bayesian,
+        use_kl=args.kl,
+        use_stoikov=args.stoikov,
+        stoikov_gamma=args.stoikov_gamma,
+        stoikov_max_improvement=args.stoikov_max_improvement,
+        seed=args.seed,
     )

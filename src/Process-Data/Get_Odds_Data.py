@@ -209,7 +209,7 @@ def backfill_season(con, season_key, value, sportsbook, today):
         df.to_sql(season_key, con, if_exists="append", index=False)
 
 
-def main(sportsbook="fanduel", backfill=False, season=None, today=None, db_path=DB_PATH):
+def main(sportsbook="kalshi", backfill=False, season=None, today=None, db_path=DB_PATH):
     config = load_config()
     if today is None:
         today = datetime.today().date()
@@ -252,8 +252,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch NBA odds data from SBR.")
     parser.add_argument(
         "--sportsbook",
-        default="fanduel",
-        help="Sportsbook key to pull odds from (default: fanduel).",
+        default="kalshi",
+        help="Odds source key (default: kalshi).",
     )
     parser.add_argument(
         "--backfill",
